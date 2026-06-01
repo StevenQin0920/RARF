@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+
+# Local development caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Local editor settings
+.vscode/
+.idea/
+
+# Raw benchmark files are tracked under datasets/raw_data/.
+# Generated split/anchor assets under datasets/<DATASET>/ are not tracked.
+/datasets/*
+!/datasets/raw_data/
+!/datasets/raw_data/**
+
+# Local/generated train-time assets
+data/
+
+# Runtime outputs
+output/
+runs/
+checkpoints/
+tables/
+*.ckpt
+*.pt
+*.pth
+
+# Non-release research workspaces
+old/
+reference/
+fig/
+fig2/
+fig3/
+robustness/
+longtimeforecasting/

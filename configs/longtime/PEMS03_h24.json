@@ -1,0 +1,36 @@
+{
+  "data": {
+    "dataset": "PEMS03",
+    "num_nodes": 358,
+    "target_value_type": "flow",
+    "paths": {
+      "dataset_root": "longtimeforecasting/h24"
+    }
+  },
+  "model": {
+    "hidden_dim": 64,
+    "node_dim": 32,
+    "horizon": 24,
+    "history_length": 24,
+    "dropout": 0.1
+  },
+  "train": {
+    "seed": 1,
+    "device": "cuda",
+    "epochs": 100,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "fft_loss_weight": 0.01,
+    "optimizer": "adamw",
+    "weight_decay": 0.0001,
+    "use_amp": true,
+    "use_ema": true,
+    "early_stopping_patience": 15
+  },
+  "eval": {
+    "report_horizons": [3, 6, 12, 24]
+  },
+  "output": {
+    "root": "output"
+  }
+}
