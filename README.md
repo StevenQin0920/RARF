@@ -1,245 +1,246 @@
 # RARF
 
-Official research code for **Rethinking Spatiotemporal Series Forecasting via Regime-Anchored Residual Dynamics**.
+Official PyTorch implementation of **Efficient Traffic Forecasting via Regime-Anchored Residual Learning**.
 
-RARF, short for **Regime-Anchored Residual Forecasting**, rethinks direct raw-value prediction in spatiotemporal series forecasting. The key idea is to reformulate forecasting as **offline regime summarization plus online residual correction**. Stable recurring spatiotemporal regime structure is represented by a frozen anchor field, and the neural model forecasts an anchor-conditioned residual correction around that anchor:
+**Cang Qin · Lina Yang · Ling Peng**
 
-```text
-Y_hat = A0_future + R_corr
-```
+RARF (**Regime-Anchored Residual Forecasting**) uses recurring daily and weekly traffic patterns as an explicit forecasting reference. It learns road-network relationships within a shared reference and predicts future departures from recent observations. An adaptive reference–observation mixture and a full historical residual channel give the dynamic predictor access to both recurring traffic levels and the current traffic state.
 
-- `A0_future`: frozen future Regime Anchor Field from train-only statistics.
-- `R_corr`: anchor-conditioned residual correction around `A0_future`.
-
-The default entrypoint trains the main RARF model path. Long-horizon and ablation experiments are included as explicit supplemental entrypoints and do not run unless requested.
+[Overview](#overview) · [Method](#method) · [Results](#results) · [Quick Start](#quick-start) · [Data and Reproduction](#data-and-reproduction) · [Citation](#citation)
 
 ## Overview
 
-Most spatiotemporal forecasting models directly map historical observations to future raw values. RARF changes the prediction target instead of only increasing model expressiveness. It separates recurring node-specific temporal regimes from sample-specific deviations:
+Traffic flow and speed often follow recurring patterns at the same sensor, time of day, and day of week. Recent traffic can depart from these patterns because of changing conditions and short-term disturbances. RARF brings these two sources of information together:
 
-1. Offline, RARF summarizes training observations into a leakage-free Frozen Regime Anchor Field.
-2. Online, future-available temporal indicators retrieve the corresponding future anchor.
-3. The neural module predicts residual correction around that anchor.
-4. Final forecasts are reconstructed as `Y_hat = A0_future + R_corr`.
+1. **Summarize recurring traffic.** Fixed daily and weekly statistics are computed from the training split for each sensor.
+2. **Learn a shared road-network reference.** Graph propagation and attention over sensors and calendar slots refine these statistics.
+3. **Predict current departures.** Historical traffic is encoded using both a reference–observation mixture and the full residual, then used to predict future corrections.
 
-This design is intended for data-intensive spatiotemporal forecasting systems where recurring regimes are strong, online inference should stay lightweight, and robustness to imperfect recent observations matters.
+Known timestamps retrieve historical and future reference values, providing daily and weekly context even when the input contains only the latest hour of traffic observations.
 
 <p align="center">
-  <img src="docs/figures/rarf_motivation.png" width="92%" alt="RARF motivation: forecasting as regime anchor plus residual correction">
+  <img src="docs/figures/rarf_motivation.png" width="1000" alt="RARF motivation: recurring traffic patterns provide a reference for predicting future departures from recent sensor observations.">
 </p>
 
-## Quick Start
+*Traffic periodicity motivates forecasting around a recurring reference. The anchor and learned corrections together reconstruct the future traffic signal.*
 
-The recommended main experiment starts from **PEMS04**.
+The manuscript evaluates forecasting accuracy together with resource use:
 
-```bash
-conda create -n STP python=3.11 -y
-conda activate STP
-
-python -m pip install --upgrade pip setuptools wheel
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install numpy==2.2.6 pandas==2.2.3
-
-python -m utils.prepare_data --datasets PEMS04 --artifact-mode split_npz
-python -m utils.regime_anchor_field --dataset PEMS04
-python main.py --config configs/PEMS04.json --device cuda --run-id pems04_rarf_seed1
-```
-
-The final test metrics are written to:
-
-```text
-output/runs/PEMS04/RARF/seed_1/pems04_rarf_seed1/test_metrics_by_horizon.csv
-```
-
-## News
-
-- Submission-stage code release for the RARF paper.
-- This release keeps the RARF main path as the default runnable path.
-- Long-horizon forecasting configs and ablation scripts are provided as explicit paper-analysis entrypoints.
-- The experiments cover six spatiotemporal forecasting benchmarks: PEMS03, PEMS04, PEMS07, PEMS08, METR-LA, and PEMS-BAY.
-- Raw benchmark files are included under `datasets/raw_data/`; generated split assets, checkpoints, outputs, and temporary result folders are intentionally excluded from git.
+- **Six traffic benchmarks:** PEMS03, PEMS04, PEMS07, PEMS08, METR-LA, and PEMS-BAY.
+- **Best or tied-best results on 16 of 18 metric–dataset combinations** among the evaluated manuscript baselines.
+- **On PEMS07, 63.0% lower peak GPU memory and 25.1% lower inference latency than STWave**, together with a 2.6% reduction in MAE.
 
 ## Method
 
-RARF is a target-space reparameterization framework. The frozen anchor defines the coordinate system of the prediction target, and the neural network learns how each sample deviates from this train-only regime reference.
-
 <p align="center">
-  <img src="docs/figures/rarf_framework.png" width="92%" alt="RARF framework overview">
+  <img src="docs/figures/rarf_framework.png" width="1000" alt="RARF framework: a frozen daily–weekly statistical anchor, shared spatial reference refinement, and history-conditioned residual prediction using Mix and the full residual R.">
 </p>
 
-### Frozen Regime Anchor Field
+*Blue denotes the statistical anchor, orange the shared spatial correction and refined reference, and green the history-conditioned dynamic correction. Mix and R denote the reference-conditioned input and full historical residual.*
 
-RARF builds train-only statistical anchors:
+### 1. Statistical anchor from recurring traffic
 
-```text
-A_daily(n, tau) = mean_train(y | node=n, TOD=tau)
-A_weekly_res(n, tau, d) = mean_train(y | node=n, TOD=tau, DOW=d) - A_daily(n, tau)
-A0(n, tau, d) = A_daily(n, tau) + A_weekly_res(n, tau, d)
-```
+For sensor $n$, time-of-day slot $\tau$, and day-of-week index $d$, the training-only statistics are
 
-The weekly file stores a day-specific residual, not a complete weekly mean.
+$$
+\begin{aligned}
+A_{\mathrm{day}}(n,\tau)
+&= \mathrm{mean}_{\mathrm{train}}(y\mid n,\tau),\\
+A_{\mathrm{week}}(n,\tau,d)
+&= \mathrm{mean}_{\mathrm{train}}(y\mid n,\tau,d)-A_{\mathrm{day}}(n,\tau),\\
+A_{\mathrm{stat}}(n,\tau,d)
+&= A_{\mathrm{day}}(n,\tau)+A_{\mathrm{week}}(n,\tau,d).
+\end{aligned}
+$$
 
-### Anchor-Conditioned Residual Correction
+The daily profile and weekly adjustment are stored as fixed buffers. Calendar indices select the relevant entries for historical and future timestamps. Future lookup uses known calendar information only.
 
-RARF predicts:
+### 2. Shared graph-aware reference
 
-```text
-R_corr = R_spatial + R_temporal
-Y_hat = A0_future + R_corr
-```
+The **Spatial-Bias Correction Branch** uses the statistical banks and physical road graph to learn recurring relationships across sensors and calendar slots. Its output refines the anchor into an effective reference:
 
-- **Spatial-Bias Correction Branch** learns context-level spatial residual correction around the frozen anchor:
+$$
+A_{\mathrm{ref}}(n,c)=A_{\mathrm{stat}}(n,c)+S_{\phi}(n,c).
+$$
 
-```text
-R_spatial = T_phi(A0 + E_table + lambda * LowRank(node, regime)) - A0
-```
+For fixed model parameters, windows with the same sensor and calendar context share this reference. The branch does not take the current observation window as input. The statistical anchor is fixed, while the effective reference is learned jointly with the dynamic predictor.
 
-- **Temporal-Bias Correction Branch** predicts history-conditioned temporal residual correction.
+### 3. History-conditioned residual prediction
 
-The default objective is final MAE on `Y_hat`. Optional FFT magnitude loss is available through `train.fft_loss_weight`; the release baseline keeps it at `0.0`.
+The **Temporal-Bias Correction Branch** describes recent traffic relative to the learned reference:
 
-## Contributions Reflected in This Code
+$$
+\begin{aligned}
+R_{\mathrm{hist}}&=X_{\mathrm{traffic}}^{\mathrm{hist}}-A_{\mathrm{ref}}^{\mathrm{hist}},\\
+X_{\mathrm{anchor}}&=A_{\mathrm{ref}}^{\mathrm{hist}}+g\odot R_{\mathrm{hist}}.
+\end{aligned}
+$$
 
-- Train-only Frozen Regime Anchor Field construction for recurring node-time regimes.
-- Anchor-conditioned residual correction with separate spatial-bias and temporal-bias correction branches.
-- Main 12-step forecasting experiments on traffic-flow and traffic-speed datasets.
-- Explicit supplemental entrypoints for long-horizon forecasting and ablation studies.
+Residual statistics guide the mixture weight $g$. The encoder receives both $X_{\mathrm{anchor}}$ and the full $R_{\mathrm{hist}}$, together with missing-observation indicators and calendar features. The mixture controls the contribution of recurring levels, while the separate residual channel preserves deviations at every historical step.
 
-## Environment
+Temporal convolutions and fixed-graph propagation encode the history. A horizon-conditioned readout and future calendar embeddings support the dynamic correction. The forecast is reconstructed as
 
-The reference server environment is:
+$$
+\hat Y=A_{\mathrm{stat}}^{\mathrm{future}}+S_{\phi}^{\mathrm{future}}+T_{\theta}
+=A_{\mathrm{ref}}^{\mathrm{future}}+T_{\theta}.
+$$
+
+Reference attention operates on shared calendar banks, while the dynamic path processes individual windows. The released implementation performs the reference transformations online; the resource measurements below include these transformations and the dynamic predictor.
+
+The full-model objective combines masked MAE on the original traffic scale with an auxiliary FFT magnitude loss of weight **0.01**. The recommended `configs/*_fft001.json` files use this setting with batch size **16**.
+
+## Results
+
+### Forecasting accuracy
+
+The following results are reported in the current manuscript. Each value is averaged over all 12 forecast steps and five independent runs. With five-minute sampling, the main setting uses the past hour to predict the next hour. Lower values are better.
+
+| Dataset | Target | MAE | RMSE | MAPE |
+| --- | --- | ---: | ---: | ---: |
+| PEMS03 | Flow | 14.00 | 25.54 | 14.99% |
+| PEMS04 | Flow | 17.98 | 30.49 | 11.90% |
+| PEMS07 | Flow | 19.18 | 33.49 | 8.04% |
+| PEMS08 | Flow | 13.37 | 23.11 | 8.86% |
+| METR-LA | Speed | 2.96 | 6.02 | 8.17% |
+| PEMS-BAY | Speed | 1.53 | 3.57 | 3.45% |
+
+On PEMS03 and METR-LA, the reported improvements over the best baseline are statistically significant ($t$-test, $p<0.05$).
+
+### Accuracy and resource use on PEMS07
+
+The manuscript measures complete-model inference on a single **NVIDIA RTX 5090 32GB**, with **batch size 16** and **12-step history and prediction**. Inference time is measured per batch of 16 windows.
+
+| Method | FLOPs (G) | Peak GPU memory (MB) | Inference time (ms/batch) | MAE |
+| --- | ---: | ---: | ---: | ---: |
+| PDFormer | 319.9 | 5314.4 | 190.0 | 20.16 |
+| STAEformer | 624.1 | 5054.5 | 61.3 | 20.06 |
+| D2STGNN | 836.5 | 2543.6 | 97.3 | 20.42 |
+| STWave | 289.5 | 2110.3 | 40.2 | 19.70 |
+| **RARF** | **240.1** | **780.7** | **30.1** | **19.18** |
+| Reduction vs. STWave | 17.1% | 63.0% | 25.1% | 2.6% |
+
+The manuscript also evaluates longer histories and horizons together ($L=H\in\lbrace24,36,48,60\rbrace$), component ablations, and prediction under delayed, held-constant, or biased historical traffic observations.
+
+## Quick Start
+
+The example below runs **PEMS04** with the full-model FFT setting. Install Git and [Git LFS](https://git-lfs.com/) before cloning; the large raw benchmark files are tracked with Git LFS.
 
 ```bash
+git lfs install
+git clone https://github.com/StevenQin0920/RARF.git
+cd RARF
+git lfs pull
+
 conda create -n STP python=3.11 -y
 conda activate STP
-
 python -m pip install --upgrade pip setuptools wheel
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install numpy==2.2.6 pandas==2.2.3
+python -m pip install -r requirements.txt
+
+python -m utils.prepare_data --datasets PEMS04 --artifact-mode split_npz
+python -m utils.regime_anchor_field --dataset PEMS04
+python main.py --config configs/PEMS04_fft001.json --device cuda --run-id pems04_rarf_fft001_seed1
 ```
 
-Alternatively:
+The test metrics are written to:
+
+```text
+output/runs/PEMS04/RARF/seed_1/pems04_rarf_fft001_seed1/test_metrics_by_horizon.csv
+```
+
+This command performs **one run with seed 1**. The manuscript table reports five-run means; see [Repeated runs](#repeated-runs) for the corresponding procedure.
+
+The supplied environment uses Python 3.11, PyTorch 2.9.1 with CUDA 12.8 wheels, NumPy 2.2.6, pandas 2.2.3, and PyTables 3.10.2. As an alternative to the environment and package-installation commands above:
 
 ```bash
 conda env create -f environment.yml
 conda activate STP
 ```
 
-or, inside an existing Python 3.11 environment:
+Training is intended for a CUDA GPU. The environment specifications are in [`requirements.txt`](requirements.txt) and [`environment.yml`](environment.yml).
 
-```bash
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-```
+## Data and Reproduction
 
-Full training is intended for CUDA GPUs. CPU execution is useful for syntax checks and small smoke tests only.
+### Dataset files and preparation
 
-## Data
+Raw benchmark assets are stored under `datasets/raw_data/`. After cloning, run `git lfs pull` to retrieve the actual data rather than just the small pointer files.
 
-Raw benchmark files are provided under `datasets/raw_data/`. For the main PEMS04 experiment, the expected raw files are:
-
-```text
-datasets/raw_data/PEMS04/PEMS04.npz
-datasets/raw_data/PEMS04/PEMS04.csv
-```
-
-PEMS03 additionally uses `PEMS03.txt` for graph node IDs. METR-LA and PEMS-BAY use HDF5 files and DCRNN-style graph pickle files.
-
-Supported dataset names in this codebase:
-
-| Dataset | Target | Nodes | Raw data file | Graph file |
+| Dataset | Target | Sensors | Raw data file | Graph files |
 | --- | --- | ---: | --- | --- |
-| PEMS03 | flow | 358 | `PEMS03.npz` | `PEMS03.csv`, `PEMS03.txt` |
-| PEMS04 | flow | 307 | `PEMS04.npz` | `PEMS04.csv` |
-| PEMS07 | flow | 883 | `PEMS07.npz` | `PEMS07.csv` |
-| PEMS08 | flow | 170 | `PEMS08.npz` | `PEMS08.csv` |
-| METR-LA | speed | 207 | `metr-la.h5` | `adj_mx.pkl` |
-| PEMS-BAY | speed | 325 | `pems-bay.h5` | `adj_mx_bay.pkl` |
+| PEMS03 | Flow | 358 | `PEMS03/PEMS03.npz` | `PEMS03/PEMS03.csv`, `PEMS03/PEMS03.txt` |
+| PEMS04 | Flow | 307 | `PEMS04/PEMS04.npz` | `PEMS04/PEMS04.csv` |
+| PEMS07 | Flow | 883 | `PEMS07/PEMS07.npz` | `PEMS07/PEMS07.csv` |
+| PEMS08 | Flow | 170 | `PEMS08/PEMS08.npz` | `PEMS08/PEMS08.csv` |
+| METR-LA | Speed | 207 | `METR-LA/metr-la.h5` | `sensor_graph/METR-LA/adj_mx.pkl` |
+| PEMS-BAY | Speed | 325 | `PEMS-BAY/pems-bay.h5` | `sensor_graph/PEMS-BAY/adj_mx_bay.pkl` |
 
-Prepare chronological split NPZ artifacts:
-
-```bash
-python -m utils.prepare_data --datasets PEMS04 --artifact-mode split_npz
-```
-
-Build the train-only Regime Anchor Field:
+All paths in this table are relative to `datasets/raw_data/`. To prepare the six datasets and their anchors:
 
 ```bash
-python -m utils.regime_anchor_field --dataset PEMS04
+python -m utils.prepare_data --datasets PEMS03 PEMS04 PEMS07 PEMS08 METR-LA PEMS-BAY --artifact-mode split_npz --rarf-assets
 ```
 
-Equivalent wrapper:
-
-```bash
-python scripts/build_assets.py --dataset PEMS04
-```
-
-Required runtime files after preparation:
+For the standard 12-step setting, the generated assets for each dataset are:
 
 ```text
-datasets/PEMS04/train.npz
-datasets/PEMS04/val.npz
-datasets/PEMS04/test.npz
-datasets/PEMS04/graphs/A_0.pkl
-datasets/PEMS04/graphs/A_phy.pkl
-datasets/PEMS04/anchors/regime_anchor_field_daily.npy
-datasets/PEMS04/anchors/regime_anchor_field_weekly.npy
-datasets/PEMS04/anchors/regime_anchor_field_metadata.json
+datasets/<DATASET>/
+├── train.npz
+├── val.npz
+├── test.npz
+├── graphs/
+│   ├── A_0.pkl
+│   └── A_phy.pkl
+└── anchors/
+    ├── regime_anchor_field_daily.npy
+    ├── regime_anchor_field_weekly.npy
+    └── regime_anchor_field_metadata.json
 ```
 
-Only raw files under `datasets/raw_data/` are tracked. Generated split and anchor assets under `datasets/<DATASET>/` should be prepared locally and are ignored by git.
+The weekly anchor file stores the day-specific adjustment to the daily profile. Generated splits, anchor assets, outputs, and checkpoints are prepared locally and ignored by Git.
 
-## Training
+### Training the six datasets
 
-Main PEMS04 command:
+Use the supplied FFT-weight-0.01 configurations:
 
 ```bash
-python main.py --config configs/PEMS04.json --device cuda --run-id pems04_rarf_seed1
+python main.py --config configs/PEMS03_fft001.json --device cuda --run-id pems03_rarf_fft001_seed1
+python main.py --config configs/PEMS04_fft001.json --device cuda --run-id pems04_rarf_fft001_seed1
+python main.py --config configs/PEMS07_fft001.json --device cuda --run-id pems07_rarf_fft001_seed1
+python main.py --config configs/PEMS08_fft001.json --device cuda --run-id pems08_rarf_fft001_seed1
+python main.py --config configs/METR-LA_fft001.json --device cuda --run-id metrla_rarf_fft001_seed1
+python main.py --config configs/PEMS-BAY_fft001.json --device cuda --run-id pemsbay_rarf_fft001_seed1
 ```
 
-Thin script wrapper:
+Alternatively, run all six datasets sequentially:
 
 ```bash
-python scripts/train.py --config configs/PEMS04.json --device cuda --run-id pems04_rarf_seed1
-```
-
-Main PEMS reproduction commands:
-
-```bash
-python main.py --config configs/PEMS03.json --device cuda --run-id pems03_rarf_seed1
-python main.py --config configs/PEMS04.json --device cuda --run-id pems04_rarf_seed1
-python main.py --config configs/PEMS07.json --device cuda --run-id pems07_rarf_seed1
-python main.py --config configs/PEMS08.json --device cuda --run-id pems08_rarf_seed1
-```
-
-Optional multi-run helper:
-
-```bash
-python scripts/train_all.py --profile nofft --device cuda
 python scripts/train_all.py --profile fft001 --device cuda
-python scripts/train_all.py --profile both --device cuda
 ```
 
-`--profile nofft` uses `configs/<DATASET>.json`; `--profile fft001` uses `configs/<DATASET>_fft001.json`.
+To inspect the generated commands without launching training:
 
-## Overall Performance
+```bash
+python scripts/train_all.py --profile fft001 --device cuda --dry-run
+```
 
-All results are averaged over five runs. Lower values are better.
+The `configs/<DATASET>.json` files remain available with FFT loss disabled and their existing per-dataset batch sizes. The `nofft` and `both` profiles of `scripts/train_all.py` select those settings or run both configuration families, respectively. The full-model commands above explicitly select `fft001`.
 
-| Dataset | MAE | RMSE | MAPE |
-| --- | ---: | ---: | ---: |
-| PEMS03 | 15.00 | 26.69 | 15.02% |
-| PEMS04 | 17.98 | 30.49 | 11.90% |
-| PEMS07 | 19.18 | 33.49 | 8.04% |
-| PEMS08 | 13.37 | 23.11 | 8.86% |
-| PEMS-BAY | 1.53 | 3.57 | 3.45% |
-| METR-LA | 3.01 | 6.19 | 8.45% |
+### Repeated runs
 
-## Long-Horizon Forecasting
+Each checked-in main configuration sets `train.seed` to `1`. For a five-run evaluation, use five distinct values of **`train.seed`** in local copies of the same configuration, keep the data split and other settings fixed, and use a distinct `--run-id` for each run. Average the `avg` rows in the resulting `test_metrics_by_horizon.csv` files.
 
-Long-horizon configs are under `configs/longtime/` for horizons 24, 36, 48, and 60. They are not used by the default 12-step main experiments.
+`--run-id` labels an output directory; changing it does not change the random seed. The multi-dataset helper runs each selected dataset and profile once with its configured seed.
 
-Prepare long-horizon split assets locally, for example:
+### Evaluation protocol
+
+- Data are split chronologically: **6:2:2** for flow datasets and **7:1:2** for speed datasets.
+- Traffic standardization and statistical anchor construction use the training split only.
+- For flow, MAE and RMSE include valid zero-flow values; MAPE excludes zero denominators.
+- For speed, zero readings are treated as missing for targets and inputs.
+- The CSV `avg` row reports metrics averaged over the forecast horizon. MAPE is stored as a ratio in the CSV; multiply by 100 to display the percentages used in the table above.
+
+### Longer-horizon forecasting
+
+The configs in `configs/longtime/` use **$L=H$** with horizons 24, 36, 48, and 60: the past 2–5 hours are used to predict the next 2–5 hours. Prepare separate assets for each sequence length. For example:
 
 ```bash
 python -m utils.prepare_data --datasets PEMS04 --processed-root longtimeforecasting/h24 --history-length 24 --horizon 24 --artifact-mode split_npz
@@ -247,107 +248,66 @@ python -m utils.regime_anchor_field --dataset PEMS04 --train-npz longtimeforecas
 python main.py --config configs/longtime/PEMS04_h24.json --device cuda --run-id pems04_h24_rarf_seed1
 ```
 
-`longtimeforecasting/` is generated data and is intentionally ignored by git.
+`longtimeforecasting/` contains locally generated data and is ignored by Git. These experiments use their own configs and are separate from the main 12-step runs.
 
-## Ablation Studies
+### Component ablations
 
-Ablation scripts live under `ablation/` and are isolated from the main `main.py` RARF training path. They write outputs to:
-
-```text
-output/runs/<dataset>/RARF_ABLATION/<variant>/seed_<seed>/<run_id>/
-```
-
-Examples:
+The [`ablation/`](ablation/) directory contains diagnostic and training entrypoints for Anchor Only, Direct Prediction, and component-removal variants. For example:
 
 ```bash
-python ablation/evaluate_anchor_only.py --config configs/PEMS04.json --device cuda --run-id pems04_anchor_only_seed1
-python ablation/train_ablation.py --config configs/PEMS04.json --variant no-spatial-branch --device cuda --run-id pems04_no_spatial_seed1
-python ablation/train_direct_prediction.py --config configs/PEMS04.json --device cuda --run-id pems04_direct_prediction_seed1
+python ablation/evaluate_anchor_only.py --config configs/PEMS04_fft001.json --device cuda --run-id pems04_anchor_only_seed1
+python ablation/train_ablation.py --config configs/PEMS04_fft001.json --variant no-spatial-branch --device cuda --run-id pems04_no_spatial_seed1
+python ablation/train_direct_prediction.py --config configs/PEMS04_fft001.json --device cuda --run-id pems04_direct_prediction_seed1
 ```
 
-Available ablation variants:
+Available variants are `anchor-only`, `direct-prediction`, `no-anchor-coordinate`, `no-fft-loss`, `no-future-time`, `no-regime-anchor`, `no-spatial-branch`, and `no-temporal-branch`. Ablation outputs are written under `output/runs/<DATASET>/RARF_ABLATION/`.
+
+### Outputs and basic checks
+
+Main-model runs use the following layout:
 
 ```text
-anchor-only
-direct-prediction
-no-anchor-coordinate
-no-fft-loss
-no-future-time
-no-regime-anchor
-no-spatial-branch
-no-temporal-branch
+output/runs/<DATASET>/RARF/seed_<SEED>/<RUN_ID>/
+├── history.csv
+├── test_metrics_by_horizon.csv
+└── checkpoints/
+    └── best.pt
 ```
 
-These scripts are for paper analysis only. The released main forecast formula remains `Y_hat = A0_future + R_corr`.
+Syntax and configuration checks:
 
-## Outputs
-
-Runs are written to:
-
-```text
-output/runs/<dataset>/RARF/seed_<seed>/<run_id>/
+```bash
+python -m compileall main.py models utils dataloader engine scripts ablation
+python -c "from utils.config import load_config, resolve_runtime_config; resolve_runtime_config(load_config('configs/PEMS04_fft001.json'))"
 ```
 
-Important files:
+After preparing the data, a one-epoch smoke run can check the training path:
 
-```text
-history.csv
-test_metrics_by_horizon.csv
-checkpoints/best.pt
+```bash
+python main.py --config configs/PEMS04_fft001.json --device cuda --epochs 1 --run-id smoke_pems04_rarf
 ```
-
-`output/` and checkpoint files are intentionally ignored by git.
 
 ## Repository Layout
 
 ```text
-main.py                                      CLI, runtime setup, training
-configs/                                    slim dataset configs
-configs/longtime/                           explicit long-horizon configs
-dataloader/                                 split NPZ and windowed loaders
-models/rarf.py                              top-level A0_future + R_corr orchestration
-models/frozen_regime_anchor/                Frozen Regime Anchor lookup
-models/anchor_conditioned_residual_correction/ Spatial-Bias and Temporal-Bias Correction branches
-engine/                                     training, evaluation, checkpoints
-utils/regime_anchor_field/                  train-only regime anchor asset builder
-scripts/                                    thin command wrappers
-ablation/                                   explicit paper ablation entrypoints
-```
-
-The GitHub release intentionally excludes generated data, training outputs, checkpoints, old baselines, external references, and temporary figure/result folders.
-
-## Reproducibility Notes for ICDE 2027
-
-Use the reference environment above, rebuild data and anchors from train-only splits, then run the commands in `Training`. Reported metrics are read from:
-
-```text
-output/runs/<dataset>/RARF/seed_<seed>/<run_id>/test_metrics_by_horizon.csv
-```
-
-For `data.target_value_type = "flow"`, MAE/RMSE use all finite labels, including zero flow, and MAPE excludes zero denominators. For `speed`, zero values are treated as missing for targets and inputs.
-
-The default 12-step main experiment is independent from long-horizon and ablation scripts. Those supplemental experiments only run when their explicit configs or scripts are invoked.
-
-## Checks
-
-Syntax check:
-
-```bash
-python -m compileall main.py models utils dataloader engine scripts ablation
-```
-
-Config check:
-
-```bash
-python -c "from utils.config import load_config, resolve_runtime_config; resolve_runtime_config(load_config('configs/PEMS04.json'))"
-```
-
-One-epoch smoke run:
-
-```bash
-python main.py --config configs/PEMS04.json --device cuda --epochs 1 --run-id smoke_pems04_rarf
+main.py                                      Training and evaluation entrypoint
+configs/                                     Main experiment configurations
+configs/longtime/                             Longer-history/horizon configurations
+dataloader/                                  Split assets, loaders, and scaling
+models/rarf.py                                Anchor, shared correction, and dynamic prediction
+models/frozen_regime_anchor/                  Frozen statistical anchor lookup
+models/anchor_conditioned_residual_correction/ Spatial and temporal correction branches
+engine/                                      Training, evaluation, and checkpoints
+utils/regime_anchor_field/                    Training-only statistical profile construction
+scripts/                                     Training and data-preparation helpers
+ablation/                                    Component and diagnostic experiments
+docs/figures/                                Method and motivation figures
 ```
 
 ## Citation
 
-If you use this repository, please cite the corresponding RARF paper. The final BibTeX entry will be added after the paper metadata is finalized.
+If you use RARF in your research, please cite the associated manuscript:
+
+> Cang Qin, Lina Yang, and Ling Peng. **Efficient Traffic Forecasting via Regime-Anchored Residual Learning**.
+
+Publication details and a final BibTeX entry will be added when available.
